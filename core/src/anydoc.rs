@@ -16,9 +16,7 @@ pub const EXTENSIONS: &[&str] = &[
 ];
 /// Bump when the parser or our normalization changes so cached conversions are rebuilt.
 pub const CACHE_VERSION: &str = "anydoc-0.2.4:adapter-1";
-const INPUT_LIMIT: u64 = 512 * 1024 * 1024;
-const OUTPUT_LIMIT: usize = 64 * 1024 * 1024;
-const TIMEOUT: Duration = Duration::from_secs(120);
+
 
 pub fn handles(path: &Path) -> bool {
     path.extension()
@@ -46,15 +44,18 @@ pub enum Outcome {
 
 /// Converts `source` to Markdown at `output`, atomically through the caller's
 /// staging path. Runs on a worker thread so a pathological file cannot hold
-/// the indexer past [`TIMEOUT`]; the thread is detached on timeout and the
+/// the indexer past the configured timeout; the thread is detached on timeout and the
 /// result discarded.
 pub fn convert(source: &Path, output: &Path, cancel: impl Fn() -> bool) -> Result<Outcome> {
+    convert_with_runtime(source, output, &Default::default(), cancel)
+}
+pub fn convert_with_runtime(source: &Path, output: &Path, runtime: &sag_protocol::runtime::RuntimeSettings, cancel: impl Fn() -> bool) -> Result<Outcome> {
     if cancel() {
         return Err(Failure::new(FailureKind::Cancelled, "已停止转换，未发布输出").into());
     }
     let size = fs::metadata(source)?.len();
-    if size > INPUT_LIMIT {
-        return Err(Failure::new(FailureKind::Memory, "文档超过 512 MiB 转换输入限制").into());
+    if size > (runtime.conversion_input_mib as u64) * 1024 * 1024 {
+        return Err(Failure::new(FailureKind::Memory, format!("文档超过 {} MiB 转换输入限制", runtime.conversion_input_mib)).into());
     }
     let bytes = fs::read(source)?;
     let bytes = normalise_csv(source, bytes);
@@ -73,8 +74,8 @@ pub fn convert(source: &Path, output: &Path, cancel: impl Fn() -> bool) -> Resul
                 if cancel() {
                     return Err(Failure::new(FailureKind::Cancelled, "已停止转换，未发布输出").into());
                 }
-                if started.elapsed() >= TIMEOUT {
-                    return Err(Failure::new(FailureKind::Timeout, "内置转换超过 120 秒时间限制").into());
+                if started.elapsed() >= Duration::from_secs(runtime.anydoc_timeout_secs) {
+                    return Err(Failure::new(FailureKind::Timeout, format!("内置转换超过 {} 秒时间限制", runtime.anydoc_timeout_secs)).into());
                 }
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
@@ -90,8 +91,8 @@ pub fn convert(source: &Path, output: &Path, cancel: impl Fn() -> bool) -> Resul
         }
         Err(error) => return Err(map_error(error).into()),
     };
-    if markdown.len() > OUTPUT_LIMIT {
-        return Err(Failure::new(FailureKind::Memory, "转换输出超过 64 MiB 限制").into());
+    if markdown.len() > runtime.conversion_output_mib * 1024 * 1024 {
+        return Err(Failure::new(FailureKind::Memory, format!("转换输出超过 {} MiB 限制", runtime.conversion_output_mib)).into());
     }
     if markdown.trim().is_empty() {
         return Err(Failure::new(FailureKind::Compatibility, "内置转换未提取到正文").into());
@@ -136,6 +137,18 @@ fn normalise_csv(source: &Path, bytes: Vec<u8>) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn configured_input_limit_is_applied_before_parsing() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("large.pdf");
+        fs::File::create(&source).unwrap().set_len(2 * 1024 * 1024).unwrap();
+        let mut runtime = sag_protocol::runtime::RuntimeSettings::default();
+        runtime.conversion_input_mib = 1;
+        let error = convert_with_runtime(&source, &dir.path().join("out.md"), &runtime, || false).unwrap_err();
+        assert!(error.to_string().contains("1 MiB"));
+        assert!(!dir.path().join("out.md").exists());
+    }
+
     fn docx(paragraph: &str) -> Vec<u8> {
         use std::io::Write;
         let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
